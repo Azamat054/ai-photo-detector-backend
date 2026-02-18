@@ -26,7 +26,7 @@ app = FastAPI(title="AI Detector API")
 # ✅ CORS — ГЛАВНОЕ ИСПРАВЛЕНИЕ
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://ai-photo-detector-mobile.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

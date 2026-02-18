@@ -1,19 +1,36 @@
+import os
 import torch
 import cv2
 import numpy as np
+from typing import Optional
 from PIL import Image
 from transformers import AutoImageProcessor, SiglipForImageClassification
 
 MODEL_ID = "Ateeqq/ai-vs-human-image-detector"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-model = SiglipForImageClassification.from_pretrained(MODEL_ID)
-model.to(device)
-model.eval()
+# model/processor will be initialized on first use to avoid long import time
+processor: Optional[AutoImageProcessor] = None
+model: Optional[SiglipForImageClassification] = None
+
+def _load_model() -> None:
+    """Lazy load the transformer processor and model."""
+    global processor, model
+    if processor is None or model is None:
+        processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+        model = SiglipForImageClassification.from_pretrained(MODEL_ID)
+        model.to(device)
+        model.eval()
 
 
-def predict_image(image_path: str):
+
+def predict_image(image_path: str) -> dict:
+    """Return prediction for a single image file.
+
+    Raises FileNotFoundError or PIL.UnidentifiedImageError if the file
+    cannot be opened.
+    """
+    _load_model()
     image = Image.open(image_path).convert("RGB")
     inputs = processor(images=image, return_tensors="pt").to(device)
 
@@ -29,8 +46,19 @@ def predict_image(image_path: str):
     }
 
 
-def predict_video(video_path: str, step=10):
+def predict_video(video_path: str, step: int = 10) -> dict:
+    """Sample frames from a video and return an aggregated prediction.
+
+    The `step` parameter controls how often (by frame count) we sample.
+    """
+    _load_model()
+
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(video_path)
+
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"cannot open video: {video_path}")
 
     results = []
     count = 0
@@ -66,8 +94,8 @@ def predict_video(video_path: str, step=10):
     ai = [r["confidence"] for r in results if r["label"] == "ai"]
     hum = [r["confidence"] for r in results if r["label"] == "hum"]
 
-    ai_score = np.mean(ai) if ai else 0
-    hum_score = np.mean(hum) if hum else 0                  
+    ai_score = float(np.mean(ai)) if ai else 0.0
+    hum_score = float(np.mean(hum)) if hum else 0.0
 
     return {
         "final_label": "ai" if ai_score > hum_score else "hum",
@@ -75,3 +103,18 @@ def predict_video(video_path: str, step=10):
         "human_score": hum_score,
         "frames": len(results)
     }
+
+
+if __name__ == "__main__":
+    # simple command‑line test harness
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run detector on an image or video")
+    parser.add_argument("path", help="path to image or video file")
+    parser.add_argument("--video", action="store_true", help="treat path as video")
+    args = parser.parse_args()
+
+    if args.video:
+        print(predict_video(args.path))
+    else:
+        print(predict_image(args.path))
