@@ -10,17 +10,17 @@ import traceback
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, UnidentifiedImageError
-from transformers import AutoProcessor, SiglipForImageClassification
+from transformers import AutoImageProcessor, SiglipForImageClassification
 
 MODEL_IDENTIFIER = "Ateeqq/ai-vs-human-image-detector"
 
 MAX_IMAGE_SIZE = 10 * 1024 * 1024      # 10MB
 MAX_VIDEO_SIZE = 50 * 1024 * 1024      # 50MB
-MAX_VIDEO_SECONDS = 30                 # 30 сек
+MAX_VIDEO_SECONDS = 30                 # 30 sec
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Cache for HF models
+# HuggingFace cache
 os.environ["TRANSFORMERS_CACHE"] = "./models_cache"
 os.makedirs("./models_cache", exist_ok=True)
 
@@ -31,7 +31,7 @@ _model_lock = asyncio.Lock()
 
 
 async def get_model():
-    """Load processor/model once on first request. If it fails, logs show exact reason."""
+    """Load image processor + model only once (no tokenizer)."""
     global processor, model
 
     if processor is not None and model is not None:
@@ -40,7 +40,8 @@ async def get_model():
     async with _model_lock:
         if processor is None or model is None:
             try:
-                proc = AutoProcessor.from_pretrained(MODEL_IDENTIFIER)
+                # ✅ IMPORTANT: AutoImageProcessor (NOT AutoProcessor)
+                proc = AutoImageProcessor.from_pretrained(MODEL_IDENTIFIER)
                 mdl = SiglipForImageClassification.from_pretrained(MODEL_IDENTIFIER)
                 mdl.to(device)
                 mdl.eval()
@@ -57,7 +58,7 @@ async def get_model():
 
 app = FastAPI(title="AI Detector API")
 
-# ✅ CORS FIX (для Vercel/Web): разрешаем всем, credentials выключаем
+# ✅ CORS for web + mobile
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -88,17 +89,17 @@ async def predict_image(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Invalid image file")
 
     try:
-        processor_, model_ = await get_model()
-        inputs = processor_(images=image, return_tensors="pt").to(device)
+        proc, mdl = await get_model()
+        inputs = proc(images=image, return_tensors="pt").to(device)
 
         with torch.no_grad():
-            logits = model_(**inputs).logits
+            logits = mdl(**inputs).logits
 
         probs = torch.softmax(logits, dim=-1)
         idx = logits.argmax(-1).item()
 
         return {
-            "label": model_.config.id2label[idx],
+            "label": mdl.config.id2label[idx],
             "confidence": float(probs[0, idx].item()),
         }
     except HTTPException:
@@ -119,7 +120,6 @@ async def predict_video(file: UploadFile = File(...)):
     if len(video_bytes) > MAX_VIDEO_SIZE:
         raise HTTPException(status_code=400, detail="Video too large (max 50MB)")
 
-    # save temp video
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(video_bytes)
         video_path = tmp.name
@@ -139,7 +139,7 @@ async def predict_video(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Video too long (max 30 sec)")
 
     try:
-        processor_, model_ = await get_model()
+        proc, mdl = await get_model()
 
         results = []
         frame_count = 0
@@ -155,16 +155,16 @@ async def predict_video(file: UploadFile = File(...)):
                 continue
 
             img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            inputs = processor_(images=img, return_tensors="pt").to(device)
+            inputs = proc(images=img, return_tensors="pt").to(device)
 
             with torch.no_grad():
-                logits = model_(**inputs).logits
+                logits = mdl(**inputs).logits
 
             probs = torch.softmax(logits, dim=-1)
             idx = logits.argmax(-1).item()
 
             results.append({
-                "label": model_.config.id2label[idx],
+                "label": mdl.config.id2label[idx],
                 "confidence": float(probs[0, idx].item()),
             })
 
@@ -204,7 +204,6 @@ async def predict_video(file: UploadFile = File(...)):
             pass
 
 
-# Local run (Railway обычно запускает через Procfile/Start Command)
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
