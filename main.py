@@ -12,21 +12,25 @@ from transformers import AutoImageProcessor, SiglipForImageClassification
 
 MODEL_IDENTIFIER = "Ateeqq/ai-vs-human-image-detector"
 
+MAX_IMAGE_SIZE = 10 * 1024 * 1024      # 10MB
+MAX_VIDEO_SIZE = 50 * 1024 * 1024      # 50MB
+MAX_VIDEO_SECONDS = 30                 # 30 секунд максимум
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 os.environ["TRANSFORMERS_CACHE"] = "./models_cache"
 
-processor = AutoImageProcessor.from_pretrained(MODEL_IDENTIFIER)
+# explicitly request the fast processor to avoid the "slow image processor" warning
+processor = AutoImageProcessor.from_pretrained(MODEL_IDENTIFIER, use_fast=True)
 model = SiglipForImageClassification.from_pretrained(MODEL_IDENTIFIER)
 model.to(device)
 model.eval()
 
 app = FastAPI(title="AI Detector API")
 
-# ✅ CORS — ГЛАВНОЕ ИСПРАВЛЕНИЕ
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ai-photo-detector-mobile.vercel.app"],
+    allow_origins=["*"],  # можно сузить позже
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,14 +44,19 @@ def root():
 
 @app.post("/predict")
 async def predict_image(file: UploadFile = File(...)):
+
     if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Not an image")
+        raise HTTPException(status_code=400, detail="Invalid image type")
+
+    image_bytes = await file.read()
+
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=400, detail="Image too large (max 10MB)")
 
     try:
-        image_bytes = await file.read()
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except UnidentifiedImageError:
-        raise HTTPException(status_code=400, detail="Invalid image")
+        raise HTTPException(status_code=400, detail="Invalid image file")
 
     inputs = processor(images=image, return_tensors="pt").to(device)
 
@@ -66,16 +75,33 @@ async def predict_image(file: UploadFile = File(...)):
 
 @app.post("/predict-video")
 async def predict_video(file: UploadFile = File(...)):
+
     if not file.content_type.startswith("video/"):
-        raise HTTPException(status_code=400, detail="Not a video")
+        raise HTTPException(status_code=400, detail="Invalid video type")
+
+    video_bytes = await file.read()
+
+    if len(video_bytes) > MAX_VIDEO_SIZE:
+        raise HTTPException(status_code=400, detail="Video too large (max 50MB)")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(await file.read())
+        tmp.write(video_bytes)
         video_path = tmp.name
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        os.remove(video_path)
         raise HTTPException(status_code=500, detail="Cannot open video")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+
+    duration = total_frames / fps if fps > 0 else 0
+
+    if duration > MAX_VIDEO_SECONDS:
+        cap.release()
+        os.remove(video_path)
+        raise HTTPException(status_code=400, detail="Video too long (max 30 sec)")
 
     results = []
     frame_count = 0
@@ -108,13 +134,17 @@ async def predict_video(file: UploadFile = File(...)):
             break
 
     cap.release()
+    os.remove(video_path)
 
     ai = [r["confidence"] for r in results if r["label"] == "ai"]
     hum = [r["confidence"] for r in results if r["label"] == "hum"]
 
+    ai_mean = float(np.mean(ai)) if ai else 0.0
+    hum_mean = float(np.mean(hum)) if hum else 0.0
+
     return {
-        "final_label": "ai" if np.mean(ai) > np.mean(hum) else "hum",
-        "ai_score": round(float(np.mean(ai)) if ai else 0, 4),
-        "human_score": round(float(np.mean(hum)) if hum else 0, 4),
+        "final_label": "ai" if ai_mean > hum_mean else "hum",
+        "ai_score": round(ai_mean, 4),
+        "human_score": round(hum_mean, 4),
         "frames": len(results),
     }
